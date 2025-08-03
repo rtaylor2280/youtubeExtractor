@@ -1,0 +1,24 @@
+# Node / local dev
+node_modules/
+dist/
+.env
+.vscode/
+.DS_Store
+
+# Logs
+*.log
+
+# Build artifacts
+*.zip
+*.tar.gz
+
+# OS-specific
+Thumbs.db
+
+# API output and temp directories
+api/temp/
+api/outputs/
+
+# Optional: lock files if you use npm or yarn
+package-lock.json
+yarn.lock
