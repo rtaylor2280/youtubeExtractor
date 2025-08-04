@@ -1,6 +1,7 @@
 // api/server.js - VPS server with extraction logic
 import express from "express";
 import cors from "cors";
+import 'dotenv/config';
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs/promises';
