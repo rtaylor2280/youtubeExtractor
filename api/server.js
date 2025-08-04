@@ -317,17 +317,27 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
     });
 
     // Handle yt-dlp process exit
+    let ytDlpFinished = false;
+    let ffmpegFinished = false;
+    
     ytDlpProcess.on('close', (code) => {
+      ytDlpFinished = true;
       if (code !== 0 && !errorOccurred) {
         console.error(`yt-dlp exited with code ${code}`);
+        errorHandler(new Error(`yt-dlp failed with code ${code}`), 'yt-dlp');
       } else {
+        console.log('yt-dlp finished successfully');
         broadcastProgress(100, 'converting');
+        // Close ffmpeg input to signal end of data
+        if (ffmpegProcess && ffmpegProcess.stdin && !ffmpegProcess.stdin.destroyed) {
+          ffmpegProcess.stdin.end();
+        }
       }
-      // Don't close ffmpeg stdin here, let it finish processing
     });
 
     // Handle ffmpeg process completion
     ffmpegProcess.on('close', async (code) => {
+      ffmpegFinished = true;
       clearTimeout(timeoutId);
       
       if (errorOccurred || code !== 0) {
@@ -338,6 +348,12 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
             res.status(500).json({ error: 'Audio extraction failed' });
           }
         }
+        return;
+      }
+
+      // Only proceed if yt-dlp has also finished
+      if (!ytDlpFinished) {
+        console.log('ffmpeg finished but waiting for yt-dlp...');
         return;
       }
 
