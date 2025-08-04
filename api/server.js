@@ -1,4 +1,4 @@
-// api/server.js - VPS server with extraction logic
+// api/server.js - Local Mac server with extraction logic
 import express from "express";
 import cors from "cors";
 import 'dotenv/config';
@@ -7,13 +7,32 @@ import path from 'path';
 import fs from 'fs/promises';
 import { createReadStream } from 'fs';
 import { v4 as uuidv4 } from 'uuid';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import os from 'os';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
+// Security middleware
+app.use(helmet({
+  contentSecurityPolicy: false, // Allow file downloads
+}));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: { error: 'Too many requests, please try again later.' }
+});
+app.use('/api/', limiter);
+
+// CORS and body parsing
 app.use(cors());
 app.use(express.json());
+
+// Trust proxy setting for rate limiting behind router
+app.set('trust proxy', 1);
 
 // API Key middleware
 function apiKeyMiddleware(req, res, next) {
@@ -21,6 +40,7 @@ function apiKeyMiddleware(req, res, next) {
   const validKey = process.env.JMT_API_KEY;
 
   if (!key || key !== validKey) {
+    console.log(`Unauthorized access attempt from ${req.ip} at ${new Date().toISOString()}`);
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
@@ -28,7 +48,12 @@ function apiKeyMiddleware(req, res, next) {
 
 // Health check endpoint (no auth required)
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", time: new Date().toISOString() });
+  res.json({ 
+    status: "ok", 
+    time: new Date().toISOString(),
+    platform: os.platform(),
+    arch: os.arch()
+  });
 });
 
 // Audio extraction endpoint (auth required)
@@ -40,12 +65,14 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
     endTime
   } = req.body;
 
+  console.log(`Extraction request from ${req.ip}: ${videoUrl}`);
+
   // Input validation
   if (!videoUrl || typeof videoUrl !== 'string') {
     return res.status(400).json({ error: 'Missing or invalid videoUrl parameter' });
   }
 
-  // Validate URL format
+  // Validate URL format (support both youtube.com and youtu.be)
   const urlPattern = /^https?:\/\/(www\.)?(youtube\.com\/watch\?v=|youtu\.be\/)[a-zA-Z0-9_-]{11}/;
   if (!urlPattern.test(videoUrl)) {
     return res.status(400).json({ error: 'Invalid YouTube URL format' });
@@ -77,17 +104,17 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'Start time must be before end time' });
   }
 
-  // Generate secure temp filename
+  // Generate secure temp filename in system temp directory
   const tempId = uuidv4();
   const tempFile = `audio_${tempId}.${safeFormat}`;
-  const outputPath = path.join('/tmp', tempFile);
+  const outputPath = path.join(os.tmpdir(), tempFile);
 
   let ytDlpProcess = null;
   let ffmpegProcess = null;
 
   try {
     // Set timeout for the entire operation
-    const timeoutMs = 5 * 60 * 1000; // 5 minutes
+    const timeoutMs = 10 * 60 * 1000; // 10 minutes
     const timeoutId = setTimeout(() => {
       if (ytDlpProcess) ytDlpProcess.kill('SIGKILL');
       if (ffmpegProcess) ffmpegProcess.kill('SIGKILL');
@@ -97,17 +124,26 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
       }
     }, timeoutMs);
 
-    // Start yt-dlp process
+    // Start yt-dlp process with best compatibility settings for Mac
     const ytDlpArgs = [
-      '-f', 'bestaudio',
+      '-f', 'bestaudio/best',
       '-o', '-',
       '--no-warnings',
-      '--extractor-args', 'youtube:player_client=android',
-      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      '--extract-flat', 'false',
+      '--no-check-certificates', // Sometimes needed on Mac
       videoUrl
     ];
 
-    ytDlpProcess = spawn('yt-dlp', ytDlpArgs, {
+    // Check if yt-dlp is installed
+    const ytDlpCommand = await findExecutable('yt-dlp');
+    if (!ytDlpCommand) {
+      clearTimeout(timeoutId);
+      return res.status(500).json({ 
+        error: 'yt-dlp not found. Please install with: brew install yt-dlp' 
+      });
+    }
+
+    ytDlpProcess = spawn(ytDlpCommand, ytDlpArgs, {
       stdio: ['ignore', 'pipe', 'pipe']
     });
 
@@ -144,8 +180,18 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
 
     ffmpegArgs.push(outputPath);
 
+    // Check if ffmpeg is installed
+    const ffmpegCommand = await findExecutable('ffmpeg');
+    if (!ffmpegCommand) {
+      clearTimeout(timeoutId);
+      if (ytDlpProcess) ytDlpProcess.kill('SIGKILL');
+      return res.status(500).json({ 
+        error: 'ffmpeg not found. Please install with: brew install ffmpeg' 
+      });
+    }
+
     // Start ffmpeg process
-    ffmpegProcess = spawn('ffmpeg', ffmpegArgs, {
+    ffmpegProcess = spawn(ffmpegCommand, ffmpegArgs, {
       stdio: ['pipe', 'pipe', 'pipe']
     });
 
@@ -179,7 +225,15 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
       console.error('ffmpeg stderr:', data.toString());
     });
 
-    // Handle process completion
+    // Handle yt-dlp process exit
+    ytDlpProcess.on('close', (code) => {
+      if (code !== 0 && !errorOccurred) {
+        console.error(`yt-dlp exited with code ${code}`);
+      }
+      // Don't close ffmpeg stdin here, let it finish processing
+    });
+
+    // Handle ffmpeg process completion
     ffmpegProcess.on('close', async (code) => {
       clearTimeout(timeoutId);
       
@@ -200,6 +254,8 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
         if (stats.size === 0) {
           throw new Error('Output file is empty');
         }
+
+        console.log(`Successfully extracted audio: ${stats.size} bytes`);
 
         // Set response headers
         const contentType = safeFormat === 'wav' ? 'audio/wav' : 'audio/mpeg';
@@ -245,12 +301,58 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
 });
 
 // Catch-all 404 for anything else
-app.use((req, res) => res.status(404).send("Not found"));
-
-// Start listening
-app.listen(PORT, () => {
-  console.log(`VPS Extraction API up on http://0.0.0.0:${PORT}`);
+app.use((req, res) => {
+  console.log(`404 request from ${req.ip}: ${req.method} ${req.path}`);
+  res.status(404).json({ error: "Not found" });
 });
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('Received SIGTERM, shutting down gracefully');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('Received SIGINT, shutting down gracefully');
+  process.exit(0);
+});
+
+// Start listening 
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Local Extraction API running on http://0.0.0.0:${PORT}`);
+  console.log(`Platform: ${os.platform()} ${os.arch()}`);
+  console.log(`Node version: ${process.version}`);
+  console.log(`Started at: ${new Date().toISOString()}`);
+});
+
+/**
+ * Find executable in PATH (cross-platform)
+ */
+async function findExecutable(command) {
+  const { spawn } = await import('child_process');
+  
+  return new Promise((resolve) => {
+    const which = process.platform === 'win32' ? 'where' : 'which';
+    const proc = spawn(which, [command], { stdio: 'pipe' });
+    
+    let output = '';
+    proc.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+    
+    proc.on('close', (code) => {
+      if (code === 0 && output.trim()) {
+        resolve(output.trim().split('\n')[0]);
+      } else {
+        resolve(null);
+      }
+    });
+    
+    proc.on('error', () => {
+      resolve(null);
+    });
+  });
+}
 
 /**
  * Parse time string (mm:ss or hh:mm:ss) to seconds
@@ -273,7 +375,7 @@ function parseTimeToSeconds(timeStr) {
     // hh:mm:ss format
     const [hours, minutes, seconds] = parts;
     if (minutes >= 60 || seconds >= 60) return null;
-    return hours * 3600 + minutes * 60 + seconds;
+    return hours * 3600 + minutes * 60 seconds;
   }
 
   return null;
@@ -285,8 +387,9 @@ function parseTimeToSeconds(timeStr) {
 async function cleanup(filePath) {
   try {
     await fs.unlink(filePath);
+    console.log(`Cleaned up temp file: ${filePath}`);
   } catch (error) {
-    // Ignore cleanup errors
+    // Ignore cleanup errors but log them
     console.warn('Cleanup warning:', error.message);
   }
 }
