@@ -79,7 +79,7 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
   }
 
   // Whitelist and validate format
-  const allowedFormats = ['mp3', 'wav'];
+  const allowedFormats = ['mp3', 'wav', 'saber-wav'];
   const safeFormat = allowedFormats.includes(format) ? format : 'mp3';
 
   // Validate and convert time inputs
@@ -162,11 +162,18 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
     }
 
     // Add format-specific options
-    if (safeFormat === 'wav') {
+    if (safeFormat === 'saber-wav') {
       ffmpegArgs.push(
         '-acodec', 'pcm_s16le',
         '-ar', '44100',
         '-ac', '1', // mono for saber compatibility
+        '-f', 'wav'
+      );
+    } else if (safeFormat === 'wav') {
+      ffmpegArgs.push(
+        '-acodec', 'pcm_s16le',
+        '-ar', '48000', // higher quality for general use
+        '-ac', '2', // stereo for general use
         '-f', 'wav'
       );
     } else {
@@ -257,8 +264,8 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
         console.log(`Successfully extracted audio: ${stats.size} bytes`);
 
         // Set response headers
-        const contentType = safeFormat === 'wav' ? 'audio/wav' : 'audio/mpeg';
-        const filename = `extracted_audio.${safeFormat}`;
+        const contentType = (safeFormat === 'wav' || safeFormat === 'saber-wav') ? 'audio/wav' : 'audio/mpeg';
+        const filename = `extracted_audio.${safeFormat === 'saber-wav' ? 'wav' : safeFormat}`;
         
         res.setHeader('Content-Type', contentType);
         res.setHeader('Content-Length', stats.size);
