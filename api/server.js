@@ -428,14 +428,16 @@ function parseTimeToSeconds(timeStr) {
 }
 
 /**
- * Clean up temporary files
+ * Clean up temporary files (prevents double cleanup)
  */
 async function cleanup(filePath) {
   try {
     await fs.unlink(filePath);
     console.log(`Cleaned up temp file: ${filePath}`);
   } catch (error) {
-    // Ignore cleanup errors but log them
-    console.warn('Cleanup warning:', error.message);
+    // Only log if it's not "file not found" (already cleaned up)
+    if (error.code !== 'ENOENT') {
+      console.warn('Cleanup warning:', error.message);
+    }
   }
 }
