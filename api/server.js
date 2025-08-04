@@ -375,7 +375,7 @@ function parseTimeToSeconds(timeStr) {
     // hh:mm:ss format
     const [hours, minutes, seconds] = parts;
     if (minutes >= 60 || seconds >= 60) return null;
-    return hours * 3600 + minutes * 60 seconds;
+    return hours * 3600 + minutes * 60 + seconds;
   }
 
   return null;
