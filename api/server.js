@@ -102,7 +102,6 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
       '-f', 'bestaudio',
       '-o', '-',
       '--no-warnings',
-      '--extract-flat', 'false',
       videoUrl
     ];
 
