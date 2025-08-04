@@ -129,7 +129,6 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
       '-f', 'bestaudio/best',
       '-o', '-',
       '--no-warnings',
-      '--extract-flat', 'false',
       '--no-check-certificates', // Sometimes needed on Mac
       videoUrl
     ];
