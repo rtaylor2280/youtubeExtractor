@@ -12,7 +12,7 @@ import rateLimit from 'express-rate-limit';
 import os from 'os';
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8443;
 
 // Security middleware
 app.use(helmet({
@@ -56,13 +56,43 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Audio extraction endpoint (auth required)
+// Progress streaming endpoint (no auth for SSE simplicity)
+app.get("/api/extract-progress/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  
+  // Set up Server-Sent Events
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Cache-Control'
+  });
+
+  // Send initial connection message
+  res.write(`data: ${JSON.stringify({ type: 'connected', sessionId })}\n\n`);
+
+  // Store client connection for progress updates
+  const clientId = uuidv4();
+  if (!global.progressClients) global.progressClients = new Map();
+  global.progressClients.set(clientId, { res, sessionId });
+
+  // Clean up on client disconnect
+  req.on('close', () => {
+    if (global.progressClients) {
+      global.progressClients.delete(clientId);
+    }
+  });
+});
+
+// Enhanced extraction endpoint with optional progress streaming
 app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
   const {
     videoUrl,
     format = 'mp3',
     startTime,
-    endTime
+    endTime,
+    sessionId // Optional session ID for progress tracking
   } = req.body;
 
   console.log(`Extraction request from ${req.ip}: ${videoUrl}`);
@@ -104,6 +134,27 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'Start time must be before end time' });
   }
 
+  // Function to broadcast progress to SSE clients
+  const broadcastProgress = (progress, phase = 'download') => {
+    if (sessionId && global.progressClients) {
+      for (const [clientId, client] of global.progressClients.entries()) {
+        if (client.sessionId === sessionId) {
+          try {
+            client.res.write(`data: ${JSON.stringify({ 
+              type: 'progress', 
+              progress: progress, 
+              phase: phase,
+              sessionId: sessionId 
+            })}\n\n`);
+          } catch (error) {
+            // Client disconnected, remove from map
+            global.progressClients.delete(clientId);
+          }
+        }
+      }
+    }
+  };
+
   // Generate secure temp filename in system temp directory
   const tempId = uuidv4();
   const tempFile = `audio_${tempId}.${safeFormat}`;
@@ -124,11 +175,14 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
       }
     }, timeoutMs);
 
+    broadcastProgress(0, 'starting');
+
     // Start yt-dlp process with best compatibility settings for Mac
     const ytDlpArgs = [
-      '-f', 'bestaudio/best',
+      '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[height<=480]',
       '-o', '-',
       '--no-warnings',
+      '--prefer-ffmpeg',
       '--no-check-certificates', // Sometimes needed on Mac
       videoUrl
     ];
@@ -231,8 +285,18 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
     ytDlpProcess.on('error', (error) => errorHandler(error, 'yt-dlp'));
     ffmpegProcess.on('error', (error) => errorHandler(error, 'ffmpeg'));
 
+    // Parse progress from yt-dlp stderr and broadcast to SSE clients
     ytDlpProcess.stderr.on('data', (data) => {
-      console.error('yt-dlp stderr:', data.toString());
+      const output = data.toString();
+      console.error('yt-dlp stderr:', output);
+      
+      // Extract progress percentage
+      const progressMatch = output.match(/\[download\]\s+(\d+\.\d+)%/);
+      if (progressMatch) {
+        const progress = parseFloat(progressMatch[1]);
+        broadcastProgress(progress, 'downloading');
+        console.log(`Download progress: ${progress}%`);
+      }
     });
 
     ffmpegProcess.stderr.on('data', (data) => {
@@ -256,6 +320,8 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
     ytDlpProcess.on('close', (code) => {
       if (code !== 0 && !errorOccurred) {
         console.error(`yt-dlp exited with code ${code}`);
+      } else {
+        broadcastProgress(100, 'converting');
       }
       // Don't close ffmpeg stdin here, let it finish processing
     });
@@ -283,6 +349,7 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
         }
 
         console.log(`Successfully extracted audio: ${stats.size} bytes`);
+        broadcastProgress(100, 'complete');
 
         // Set response headers
         const contentType = (safeFormat === 'wav' || safeFormat === 'saber-wav') ? 'audio/wav' : 'audio/mpeg';
