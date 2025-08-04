@@ -204,6 +204,14 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
     // Pipe yt-dlp output to ffmpeg input
     ytDlpProcess.stdout.pipe(ffmpegProcess.stdin);
 
+    // Handle client disconnection
+    req.on('close', () => {
+      console.log('Client disconnected, stopping processes');
+      if (ytDlpProcess) ytDlpProcess.kill('SIGKILL');
+      if (ffmpegProcess) ffmpegProcess.kill('SIGKILL');
+      cleanup(outputPath);
+    });
+
     // Handle errors
     let errorOccurred = false;
     const errorHandler = (error, processName) => {
@@ -229,6 +237,19 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
 
     ffmpegProcess.stderr.on('data', (data) => {
       console.error('ffmpeg stderr:', data.toString());
+    });
+
+    // Handle pipe errors to prevent crashes
+    ytDlpProcess.stdout.on('error', (error) => {
+      if (error.code !== 'EPIPE') {
+        console.error('yt-dlp stdout error:', error);
+      }
+    });
+
+    ffmpegProcess.stdin.on('error', (error) => {
+      if (error.code !== 'EPIPE') {
+        console.error('ffmpeg stdin error:', error);
+      }
     });
 
     // Handle yt-dlp process exit
@@ -265,7 +286,7 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
 
         // Set response headers
         const contentType = (safeFormat === 'wav' || safeFormat === 'saber-wav') ? 'audio/wav' : 'audio/mpeg';
-        const filename = `extracted_audio.${safeFormat === 'saber-wav' ? 'wav' : safeFormat}`;
+        const filename = safeFormat === 'saber-wav' ? 'extracted_audio.wav' : `extracted_audio.${safeFormat}`;
         
         res.setHeader('Content-Type', contentType);
         res.setHeader('Content-Length', stats.size);
@@ -283,6 +304,13 @@ app.post("/api/extract-audio", apiKeyMiddleware, async (req, res) => {
         });
 
         stream.on('end', () => {
+          cleanup(outputPath);
+        });
+
+        // Handle client disconnect during streaming
+        res.on('close', () => {
+          console.log('Client disconnected during file streaming');
+          stream.destroy();
           cleanup(outputPath);
         });
 
@@ -321,6 +349,18 @@ process.on('SIGTERM', () => {
 process.on('SIGINT', () => {
   console.log('Received SIGINT, shutting down gracefully');
   process.exit(0);
+});
+
+// Handle uncaught exceptions to prevent crashes
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  // Don't exit - log and continue
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't exit - log and continue
 });
 
 // Start listening 
